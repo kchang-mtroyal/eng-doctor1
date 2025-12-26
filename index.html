@@ -26,6 +26,10 @@
         // --- Global Cache ---
         const ttsCache = {}; 
         let apiRateLimitedUntil = 0; 
+        
+        // Default settings
+        const DEFAULT_VOICE = "Aoede";
+        const DEFAULT_USE_SYSTEM_CN = false; // Default to AI for Chinese as requested
 
         // --- Data: Curriculum ---
         const LEVELS = {
@@ -145,6 +149,14 @@
             }
         };
 
+        const VOICES = [
+            { id: "Aoede", name: "女聲 (有活力) - Aoede" },
+            { id: "Kore", name: "女聲 (溫柔) - Kore" },
+            { id: "Charon", name: "男聲 (低沉) - Charon" },
+            { id: "Fenrir", name: "男聲 (有活力) - Fenrir" },
+            { id: "Puck", name: "男聲 (溫和) - Puck" }
+        ];
+
         // --- Helpers ---
         function addWavHeader(pcmData, sampleRate = 24000, numChannels = 1) {
             const header = new ArrayBuffer(44);
@@ -165,7 +177,7 @@
             utterance.lang = lang;
             const voices = window.speechSynthesis.getVoices();
             let preferredVoice = null;
-            if (lang === 'zh-TW') preferredVoice = voices.find(v => v.lang.includes("zh") || v.name.includes("Taiwan"));
+            if (lang === 'zh-TW') preferredVoice = voices.find(v => v.lang.includes("zh") || v.name.includes("Taiwan") || v.name.includes("Han"));
             else preferredVoice = voices.find(v => v.name.includes("Google US") || v.name.includes("Samantha"));
             if (preferredVoice) utterance.voice = preferredVoice;
             window.speechSynthesis.speak(utterance);
@@ -175,7 +187,7 @@
         
         async function verifyApiKey(key) {
             if (!key) return { ok: false, status: "Empty" };
-            // FIX: Use gemini-2.5-flash as verified by diagnostics
+            // Uses 2.5-flash as verified
             const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
             try {
                 const response = await fetch(url, {
@@ -186,24 +198,26 @@
             } catch (e) { return { ok: false, status: "Network Error" }; }
         }
 
-        async function fetchGeminiTTS(text, apiKey) {
+        async function fetchGeminiTTS(text, apiKey, voice) {
             if (!apiKey) throw new Error("No API Key");
             if (Date.now() < apiRateLimitedUntil) throw new Error("RATE_LIMIT");
-            if (ttsCache[text]) return ttsCache[text];
             
-            // TTS endpoint - also using 2.5 flash preview tts which was in the list
+            // Cache logic: specific to text + voice combo
+            const cacheKey = `${text}_${voice}`;
+            if (ttsCache[cacheKey]) return ttsCache[cacheKey];
+            
             const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
             try {
                 const response = await fetch(url, {
                     method: "POST", headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ contents: [{ parts: [{ text: text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } } } })
+                    body: JSON.stringify({ contents: [{ parts: [{ text: text }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } })
                 });
                 if (response.status === 429) { apiRateLimitedUntil = Date.now() + 60000; throw new Error("RATE_LIMIT"); }
                 if (!response.ok) throw new Error(`API_ERROR_${response.status}`);
                 const data = await response.json();
                 const audio = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
                 if (!audio) throw new Error("NO_AUDIO");
-                ttsCache[text] = audio;
+                ttsCache[cacheKey] = audio;
                 return audio;
             } catch (error) { throw error; }
         }
@@ -214,7 +228,6 @@
             if (!apiKey) return "請輸入 API Key 才能使用 AI 家教功能。";
             if (Date.now() < apiRateLimitedUntil) return "系統忙碌中 (System Busy)...";
             
-            // FIX: Use gemini-2.5-flash
             const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
             const systemPrompt = `Role: Warm bilingual (Traditional Chinese & English) Medical English Tutor for an elderly beginner in Canada.
             Curriculum: ${CURRICULUM_CONTEXT}
@@ -232,7 +245,6 @@
         async function fetchGeminiQuiz(levelInfo, apiKey) {
             if (!apiKey || Date.now() < apiRateLimitedUntil) return getFallbackQuiz(levelInfo);
             
-            // FIX: Use gemini-2.5-flash
             const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
             const randomSentence = levelInfo.sentences[Math.floor(Math.random() * levelInfo.sentences.length)];
             const prompt = `Create a multiple-choice question for a senior patient to practice saying: "${randomSentence.en}" (${randomSentence.cn}).
@@ -262,14 +274,18 @@
 
         // --- React Components ---
         
-        function ApiKeyModal({ isOpen, onSave, hasKey }) {
+        function SettingsModal({ isOpen, onSave, hasKey, currentVoice, setVoice, useSystemCn, setUseSystemCn }) {
             const [val, setVal] = useState("");
             const [checking, setChecking] = useState(false);
             const [error, setError] = useState("");
+            const [tab, setTab] = useState('key'); 
 
-            useEffect(() => { if (!isOpen) { setVal(""); setError(""); } }, [isOpen]);
+            // Play preview logic
+            const [previewLoading, setPreviewLoading] = useState(null);
+            
+            useEffect(() => { if (!isOpen) { setVal(""); setError(""); setTab("key"); } }, [isOpen]);
 
-            const handleSave = async () => {
+            const handleSaveKey = async () => {
                 if (!val.trim()) { setError("請輸入 API Key"); return; }
                 setChecking(true); setError("");
                 const result = await verifyApiKey(val.trim());
@@ -277,46 +293,109 @@
                 if (result.ok) {
                     onSave(val.trim());
                 } else {
-                    setError(`API Key 無效 (錯誤碼: ${result.status})。請確認 Key 是否正確。`);
+                    setError(`API Key 無效 (錯誤碼: ${result.status})。`);
                 }
             };
 
-            const handleForceSave = () => {
-                if (val.trim()) onSave(val.trim());
+            const handleForceSave = () => { if (val.trim()) onSave(val.trim()); };
+            const handleSkip = () => { onSave(""); };
+
+            const playPreview = async (voiceId, apiKey) => {
+                if (!apiKey) { alert("請先輸入 API Key 才能試聽 AI 聲音。"); return; }
+                setPreviewLoading(voiceId);
+                try {
+                    // Force AI fetch regardless of Chinese setting for this specific preview
+                    const b64 = await fetchGeminiTTS("Hello Rosa, How are you doing?", apiKey, voiceId);
+                    const bin = atob(b64); const bytes = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+                    const blob = addWavHeader(bytes);
+                    const audio = new Audio(URL.createObjectURL(blob));
+                    audio.play();
+                } catch(e) { alert("試聽失敗: " + e.message); }
+                setPreviewLoading(null);
             };
 
-            const handleSkip = () => { onSave(""); };
+            // Get current key from prop or local input
+            const activeKey = hasKey ? localStorage.getItem("gemini_key") : val.trim();
 
             if (!isOpen) return null;
             return (
                 <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
-                    <div className="bg-white rounded-2xl p-6 w-full max-w-md text-center">
-                        <i className="fa-solid fa-key text-4xl text-orange-600 mb-4"></i>
-                        <h2 className="text-2xl font-bold mb-2">{hasKey ? "更換 API Key" : "歡迎使用！"}</h2>
-                        <p className="mb-4 text-gray-600 text-sm">請輸入 Google Gemini API Key 以啟用「AI 真人語音」與「AI 家教」。</p>
-                        <input value={val} onChange={e=>{setVal(e.target.value); setError("");}} placeholder="貼上 API Key..." className="w-full p-3 border-2 rounded-xl mb-2 focus:border-orange-500 outline-none" />
-                        {error && <div className="text-red-500 text-sm mb-3 text-left bg-red-50 p-2 rounded"><i className="fa-solid fa-circle-exclamation mr-1"></i>{error}</div>}
-                        
-                        <div className="flex flex-col gap-2">
-                            <button onClick={handleSave} disabled={checking} className="w-full bg-orange-600 text-white py-3 rounded-xl font-bold btn-active disabled:bg-gray-400">
-                                {checking ? <span><i className="fa-solid fa-spinner fa-spin mr-1"></i> 驗證中...</span> : "確認並開始"}
-                            </button>
-                            {error && (
-                                <button onClick={handleForceSave} className="w-full text-orange-600 py-2 rounded-xl font-medium text-sm underline">
-                                    我確定 Key 是對的，強制進入
-                                </button>
-                            )}
-                            <button onClick={handleSkip} className="w-full bg-gray-100 text-gray-500 py-3 rounded-xl font-medium btn-active">
-                                {hasKey ? "取消" : "略過 (不使用 AI)"}
-                            </button>
+                    <div className="bg-white rounded-2xl p-6 w-full max-w-md text-center max-h-[85vh] overflow-y-auto">
+                        <div className="flex justify-center mb-4 border-b pb-2 sticky top-0 bg-white">
+                            <button onClick={()=>setTab('key')} className={`px-4 py-2 font-bold ${tab==='key'?'text-orange-600 border-b-2 border-orange-600':'text-gray-400'}`}>API 金鑰</button>
+                            <button onClick={()=>setTab('voice')} className={`px-4 py-2 font-bold ${tab==='voice'?'text-orange-600 border-b-2 border-orange-600':'text-gray-400'}`}>發音設定</button>
                         </div>
-                        {!hasKey && <p className="mt-4 text-xs text-gray-400">沒有 Key 仍可使用基本單字與測驗功能。</p>}
+
+                        {tab === 'key' && (
+                            <>
+                                <h2 className="text-xl font-bold mb-2">{hasKey ? "更換 API Key" : "歡迎使用！"}</h2>
+                                <p className="mb-4 text-gray-600 text-sm">請輸入 Google Gemini API Key 以啟用「AI 真人語音」與「AI 家教」。</p>
+                                <input value={val} onChange={e=>{setVal(e.target.value); setError("");}} placeholder="貼上 API Key..." className="w-full p-3 border-2 rounded-xl mb-2 focus:border-orange-500 outline-none" />
+                                {error && <div className="text-red-500 text-sm mb-3 text-left bg-red-50 p-2 rounded"><i className="fa-solid fa-circle-exclamation mr-1"></i>{error}</div>}
+                                
+                                <div className="flex flex-col gap-2 mt-4">
+                                    <button onClick={handleSaveKey} disabled={checking} className="w-full bg-orange-600 text-white py-3 rounded-xl font-bold btn-active disabled:bg-gray-400">
+                                        {checking ? <span><i className="fa-solid fa-spinner fa-spin mr-1"></i> 驗證中...</span> : "確認並儲存"}
+                                    </button>
+                                    {error && (
+                                        <button onClick={handleForceSave} className="w-full text-orange-600 py-2 rounded-xl font-medium text-sm underline">
+                                            我確定 Key 是對的，強制進入
+                                        </button>
+                                    )}
+                                    <button onClick={handleSkip} className="w-full bg-gray-100 text-gray-500 py-3 rounded-xl font-medium btn-active">
+                                        {hasKey ? "關閉" : "略過 (不使用 AI)"}
+                                    </button>
+                                </div>
+                                {!hasKey && <p className="mt-4 text-xs text-gray-400">沒有 Key 仍可使用基本單字與測驗功能。</p>}
+                            </>
+                        )}
+
+                        {tab === 'voice' && (
+                            <>
+                                {!hasKey && <div className="bg-yellow-50 text-yellow-700 p-3 rounded-lg text-sm mb-4">請先輸入 API Key 才能使用 AI 發音功能。目前僅能使用系統語音。</div>}
+                                <h2 className="text-xl font-bold mb-4">選擇 AI 發音角色</h2>
+                                <div className="space-y-3 mb-6">
+                                    {VOICES.map(v => (
+                                        <div key={v.id} className={`flex items-center space-x-2 ${!hasKey ? 'opacity-50 pointer-events-none' : ''}`}>
+                                            <button 
+                                                onClick={() => setVoice(v.id)}
+                                                className={`flex-1 p-3 rounded-xl flex justify-between items-center border-2 text-left ${currentVoice === v.id ? 'border-orange-500 bg-orange-50 text-orange-700' : 'border-gray-200 text-gray-600'}`}
+                                            >
+                                                <span className="font-bold">{v.name}</span>
+                                                {currentVoice === v.id && <i className="fa-solid fa-check text-orange-600"></i>}
+                                            </button>
+                                            <button 
+                                                onClick={() => playPreview(v.id, activeKey)} 
+                                                className="p-3 bg-gray-100 rounded-xl text-gray-600 hover:bg-orange-100 hover:text-orange-600 transition"
+                                                title="試聽 Hello Rosa"
+                                            >
+                                                {previewLoading === v.id ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-play"></i>}
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                                
+                                <div className="border-t pt-4 text-left">
+                                    <label className="flex items-center space-x-3 cursor-pointer">
+                                        <input type="checkbox" checked={useSystemCn} onChange={e => setUseSystemCn(e.target.checked)} className="w-5 h-5 text-orange-600 rounded focus:ring-orange-500" />
+                                        <div>
+                                            <span className="font-bold text-gray-700">中文強制使用系統語音</span>
+                                            <p className="text-xs text-gray-500">如果覺得 AI 講中文有口音，開啟此選項會改用手機內建的中文發音。</p>
+                                        </div>
+                                    </label>
+                                </div>
+
+                                <button onClick={handleSkip} className="w-full bg-gray-100 text-gray-500 py-3 rounded-xl font-medium btn-active mt-6">
+                                    完成
+                                </button>
+                            </>
+                        )}
                     </div>
                 </div>
             );
         }
 
-        function AudioPlayer({ text, apiKey, speed, size=24, className="" }) {
+        function AudioPlayer({ text, apiKey, speed, voice, useSystemCn, size=24, className="" }) {
             const [loading, setLoading] = useState(false);
             const audioRef = useRef(null);
             const isChinese = /[\u4e00-\u9fa5]/.test(text);
@@ -324,34 +403,46 @@
             const play = async (e) => {
                 if (e) e.stopPropagation();
                 if (loading) return;
-                // If Chinese or NO API KEY, use browser TTS
-                if (isChinese || !apiKey) { speakWithBrowser(text, speed, isChinese?'zh-TW':'en-US'); return; }
+                
+                // Logic: 
+                // 1. No Key -> Always System
+                // 2. Chinese Text AND User wants System CN -> System
+                // 3. Otherwise -> Try AI -> Fallback System
+                if (!apiKey || (isChinese && useSystemCn)) { 
+                    speakWithBrowser(text, speed, isChinese?'zh-TW':'en-US'); 
+                    return; 
+                }
+
                 setLoading(true);
                 try {
-                    const b64 = await fetchGeminiTTS(text, apiKey);
+                    const b64 = await fetchGeminiTTS(text, apiKey, voice);
                     const bin = atob(b64); const bytes = new Uint8Array(bin.length);
                     for (let i=0; i<bin.length; i++) bytes[i] = bin.charCodeAt(i);
                     const blob = addWavHeader(bytes);
                     if (audioRef.current) { audioRef.current.src = URL.createObjectURL(blob); audioRef.current.playbackRate = speed; audioRef.current.play(); }
-                } catch (e) { speakWithBrowser(text, speed, 'en-US'); }
+                } catch (e) { 
+                    console.warn("TTS fallback", e);
+                    speakWithBrowser(text, speed, isChinese?'zh-TW':'en-US'); 
+                }
                 setLoading(false);
             };
             useEffect(() => { if(audioRef.current) audioRef.current.playbackRate = speed; }, [speed]);
             return <button onClick={play} className={`rounded-full flex items-center justify-center text-white shadow transition-colors ${loading?'bg-gray-400':'bg-orange-500 hover:bg-orange-600'} ${className}`} style={{width:size*2, height:size*2, minWidth:size*2}}>{loading?<i className="fa-solid fa-spinner fa-spin" style={{fontSize:size}}></i>:<i className="fa-solid fa-volume-high" style={{fontSize:size}}></i>}<audio ref={audioRef} className="hidden" /></button>;
         }
 
-        function AutoPlayer({ text, apiKey, speed }) {
+        function AutoPlayer({ text, apiKey, speed, voice, useSystemCn }) {
             const mounted = useRef(false);
             useEffect(() => {
                 if (!mounted.current) {
                     mounted.current = true;
                     setTimeout(async () => {
-                        if (!apiKey) { speakWithBrowser(text, speed, 'en-US'); return; }
+                        const isChinese = /[\u4e00-\u9fa5]/.test(text);
+                        if (!apiKey || (isChinese && useSystemCn)) { speakWithBrowser(text, speed, isChinese?'zh-TW':'en-US'); return; }
                         try {
-                            const b64 = await fetchGeminiTTS(text, apiKey);
+                            const b64 = await fetchGeminiTTS(text, apiKey, voice);
                             const bin = atob(b64); const bytes = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
                             const audio = new Audio(URL.createObjectURL(addWavHeader(bytes))); audio.playbackRate = speed; audio.play();
-                        } catch(e) { speakWithBrowser(text, speed, 'en-US'); }
+                        } catch(e) { speakWithBrowser(text, speed, isChinese?'zh-TW':'en-US'); }
                     }, 500);
                 }
             }, [text]);
@@ -359,10 +450,10 @@
         }
 
         function SpeedControl({ speed, setSpeed }) {
-            return <div className="flex justify-center space-x-2 my-4 bg-white p-2 rounded-xl shadow mx-4">{[{l:"🐢 龜速",v:0.5},{l:"🚶 慢速",v:0.8},{l:"🏃 正常",v:1.0}].map(o=><button key={o.l} onClick={()=>setSpeed(o.v)} className={`px-4 py-2 rounded-lg font-medium ${speed===o.v?'bg-orange-500 text-white':'bg-gray-100 text-gray-600'}`}>{o.l}</button>)}</div>;
+            return <div className="flex justify-center space-x-2 my-4 bg-white p-2 rounded-xl shadow mx-4">{[{l:"🐢 慢速",v:0.2},{l:"🚶 中速",v:0.6},{l:"🏃 正常",v:1.0}].map(o=><button key={o.l} onClick={()=>setSpeed(o.v)} className={`px-4 py-2 rounded-lg font-medium ${speed===o.v?'bg-orange-500 text-white':'bg-gray-100 text-gray-600'}`}>{o.l}</button>)}</div>;
         }
 
-        function TutorMode({ onBack, apiKey }) {
+        function TutorMode({ onBack, apiKey, voice, useSystemCn }) {
             const [msgs, setMsgs] = useState([]);
             const [input, setInput] = useState("");
             const [loading, setLoading] = useState(false);
@@ -422,7 +513,7 @@
                             <div key={i} className={`flex ${m.role==='user'?'justify-end':'justify-start'}`}>
                                 <div className={`max-w-[85%] rounded-2xl p-4 shadow text-lg ${m.role==='user'?'bg-orange-500 text-white rounded-br-none':'bg-white text-gray-800 rounded-bl-none'}`}>
                                     <p className="whitespace-pre-wrap">{m.text}</p>
-                                    {m.role==='model' && <div className="mt-2 flex justify-end"><AudioPlayer text={m.text} apiKey={apiKey} speed={0.9} size={18} className="!bg-gray-100 !text-gray-600" /></div>}
+                                    {m.role==='model' && <div className="mt-2 flex justify-end"><AudioPlayer text={m.text} apiKey={apiKey} speed={0.9} voice={voice} useSystemCn={useSystemCn} size={18} className="!bg-gray-100 !text-gray-600" /></div>}
                                 </div>
                             </div>
                         ))}
@@ -438,11 +529,11 @@
             );
         }
 
-        function QuizMode({ level, onBack, apiKey }) {
+        function QuizMode({ level, onBack, apiKey, voice, useSystemCn }) {
             const [q, setQ] = useState(null);
             const [loading, setLoading] = useState(true);
             const [feedback, setFeedback] = useState(null);
-            const [speed, setSpeed] = useState(0.85);
+            const [speed, setSpeed] = useState(1.0); // Default Normal
             const [selOpt, setSelOpt] = useState(null);
 
             useEffect(() => { loadQ(); }, []);
@@ -462,7 +553,7 @@
                                     <div className="bg-white p-5 rounded-2xl rounded-tl-none shadow max-w-[85%]">
                                         <div className="flex justify-between items-start">
                                             <div><p className="text-xl font-bold text-gray-800">{q.doctorSaysEn}</p><p className="text-base text-gray-500 mt-1">{q.doctorSaysCn}</p></div>
-                                            <AudioPlayer text={q.doctorSaysEn} apiKey={apiKey} speed={speed} size={20} className="mt-1 ml-2 !bg-blue-100 !text-blue-600" />
+                                            <AudioPlayer text={q.doctorSaysEn} apiKey={apiKey} speed={speed} voice={voice} useSystemCn={useSystemCn} size={20} className="mt-1 ml-2 !bg-blue-100 !text-blue-600" />
                                         </div>
                                     </div>
                                 </div>
@@ -471,7 +562,7 @@
                                     {q.options.map((opt, i) => (
                                         <div key={i} onClick={()=>!feedback && handleAns(opt)} className={`w-full p-4 rounded-xl border-2 transition-all flex items-center justify-between cursor-pointer bg-white ${feedback && selOpt===opt ? (opt.isCorrect?'border-green-500 bg-green-50':'border-red-500 bg-red-50') : 'border-white shadow hover:border-orange-300'}`}>
                                             <div className="flex-1"><p className={`text-lg font-bold ${feedback && selOpt===opt ? (opt.isCorrect?'text-green-800':'text-red-800') : 'text-gray-800'}`}>{opt.en}</p><p className="text-sm text-gray-500">{opt.cn}</p></div>
-                                            <div onClick={e=>e.stopPropagation()}><AudioPlayer text={opt.en} apiKey={apiKey} speed={speed} size={20} className="!bg-gray-100 !text-gray-400" /></div>
+                                            <div onClick={e=>e.stopPropagation()}><AudioPlayer text={opt.en} apiKey={apiKey} speed={speed} voice={voice} useSystemCn={useSystemCn} size={20} className="!bg-gray-100 !text-gray-400" /></div>
                                         </div>
                                     ))}
                                 </div>
@@ -480,22 +571,22 @@
                         {feedback === 'correct' && <div className="text-center py-8 animate-bounce"><div className="inline-block p-4 bg-green-100 text-green-700 rounded-full mb-2"><i className="fa-solid fa-check text-2xl"></i></div><h3 className="text-2xl font-bold text-green-700">答對了！</h3><button onClick={loadQ} className="mt-4 bg-orange-500 text-white px-8 py-3 rounded-full text-xl font-bold shadow btn-active">下一題 <i className="fa-solid fa-chevron-right ml-2"></i></button></div>}
                         {feedback === 'incorrect' && <div className="text-center py-8"><div className="inline-block p-4 bg-red-100 text-red-700 rounded-full mb-2"><i className="fa-solid fa-xmark text-2xl"></i></div><h3 className="text-2xl font-bold text-red-700">不對喔，再試試！</h3><button onClick={()=>{setFeedback(null);setSelOpt(null)}} className="mt-4 bg-gray-500 text-white px-8 py-3 rounded-full text-xl font-bold shadow btn-active">重選一次</button></div>}
                     </div>
-                    {feedback === 'correct' && selOpt && <AutoPlayer text={selOpt.en} apiKey={apiKey} speed={speed} />}
+                    {feedback === 'correct' && selOpt && <AutoPlayer text={selOpt.en} apiKey={apiKey} speed={speed} voice={voice} useSystemCn={useSystemCn} />}
                 </div>
             );
         }
 
-        function LearnMode({ level, onBack, apiKey }) {
+        function LearnMode({ level, onBack, apiKey, voice, useSystemCn }) {
             const [tab, setTab] = useState('vocab');
-            const [speed, setSpeed] = useState(0.85);
+            const [speed, setSpeed] = useState(1.0); // Default Normal
             return (
                 <div className="pb-24">
                     <div className="sticky top-0 bg-white shadow z-10 px-4 py-4 flex items-center"><button onClick={onBack} className="text-gray-600"><i className="fa-solid fa-arrow-left text-2xl"></i></button><h2 className="text-xl font-bold ml-3 text-gray-800 flex-1 truncate">{level.title}</h2></div>
                     <div className="flex p-4 space-x-4"><button onClick={()=>setTab('vocab')} className={`flex-1 py-3 rounded-2xl text-xl font-bold ${tab==='vocab'?'bg-orange-100 text-orange-700 ring-2 ring-orange-500':'bg-white border text-gray-500'}`}>單字卡</button><button onClick={()=>setTab('sentences')} className={`flex-1 py-3 rounded-2xl text-xl font-bold ${tab==='sentences'?'bg-orange-100 text-orange-700 ring-2 ring-orange-500':'bg-white border text-gray-500'}`}>句子</button></div>
                     <SpeedControl speed={speed} setSpeed={setSpeed} />
                     <div className="px-4 space-y-4">
-                        {tab==='vocab' ? level.vocab.map((v,i)=>(<div key={i} className="bg-white p-6 rounded-3xl shadow flex justify-between items-center"><div className="flex-1"><span className="px-2 py-1 bg-gray-100 text-xs rounded text-gray-500 mb-1 inline-block">{v.category}</span><h3 className="text-4xl font-bold text-gray-800">{v.en}</h3><p className="text-gray-500 font-mono">{v.kk}</p><p className="text-2xl text-orange-700">{v.cn}</p></div><AudioPlayer text={v.en} apiKey={apiKey} speed={speed} /></div>))
-                        : level.sentences.map((s,i)=>(<div key={i} className="bg-white p-6 rounded-3xl shadow"><div className="flex justify-between items-start mb-2"><span className="px-2 py-1 bg-blue-50 text-blue-600 text-xs rounded"><i className="fa-solid fa-tag mr-1"></i>{s.context}</span><AudioPlayer text={s.en} apiKey={apiKey} speed={speed} /></div><h3 className="text-2xl font-bold text-gray-800 mb-1">{s.en}</h3><p className="text-xl text-gray-600">{s.cn}</p></div>))}
+                        {tab==='vocab' ? level.vocab.map((v,i)=>(<div key={i} className="bg-white p-6 rounded-3xl shadow flex justify-between items-center"><div className="flex-1"><span className="px-2 py-1 bg-gray-100 text-xs rounded text-gray-500 mb-1 inline-block">{v.category}</span><h3 className="text-4xl font-bold text-gray-800">{v.en}</h3><p className="text-gray-500 font-mono">{v.kk}</p><p className="text-2xl text-orange-700">{v.cn}</p></div><AudioPlayer text={v.en} apiKey={apiKey} speed={speed} voice={voice} useSystemCn={useSystemCn} /></div>))
+                        : level.sentences.map((s,i)=>(<div key={i} className="bg-white p-6 rounded-3xl shadow"><div className="flex justify-between items-start mb-2"><span className="px-2 py-1 bg-blue-50 text-blue-600 text-xs rounded"><i className="fa-solid fa-tag mr-1"></i>{s.context}</span><AudioPlayer text={s.en} apiKey={apiKey} speed={speed} voice={voice} useSystemCn={useSystemCn} /></div><h3 className="text-2xl font-bold text-gray-800 mb-1">{s.en}</h3><p className="text-xl text-gray-600">{s.cn}</p></div>))}
                     </div>
                 </div>
             );
@@ -506,9 +597,13 @@
             const [showModal, setShowModal] = useState(false);
             const [view, setView] = useState("home");
             const [level, setLevel] = useState(null);
+            
+            // Settings States
+            const [voice, setVoice] = useState(localStorage.getItem("voice_id") || DEFAULT_VOICE);
+            const [useSystemCn, setUseSystemCn] = useState(localStorage.getItem("use_system_cn") === 'true'); // Default false (Use AI)
 
             useEffect(() => {
-                if (apiKey === null) setShowModal(true); // First visit
+                if (apiKey === null) setShowModal(true); 
             }, [apiKey]);
 
             const saveKey = (k) => { 
@@ -516,11 +611,23 @@
                 localStorage.setItem("gemini_key", k); 
                 setShowModal(false); 
             };
+            
+            const handleVoiceChange = (v) => { setVoice(v); localStorage.setItem("voice_id", v); };
+            const handleSystemCnChange = (val) => { setUseSystemCn(val); localStorage.setItem("use_system_cn", val); };
+            
             const selLevel = (l) => { setLevel(l); setView("level-menu"); };
 
             return (
                 <div className="max-w-md mx-auto min-h-screen bg-[#FFF5F5] shadow-2xl relative overflow-hidden">
-                    <ApiKeyModal isOpen={showModal} onSave={saveKey} hasKey={!!apiKey} />
+                    <SettingsModal 
+                        isOpen={showModal} 
+                        onSave={saveKey} 
+                        hasKey={!!apiKey} 
+                        currentVoice={voice} 
+                        setVoice={handleVoiceChange} 
+                        useSystemCn={useSystemCn}
+                        setUseSystemCn={handleSystemCnChange}
+                    />
                     
                     {view === "home" && (
                         <>
@@ -549,9 +656,9 @@
                             </div>
                         </div>
                     )}
-                    {view === "learn" && <LearnMode level={level} onBack={()=>setView("level-menu")} apiKey={apiKey} />}
-                    {view === "quiz" && <QuizMode level={level} onBack={()=>setView("level-menu")} apiKey={apiKey} />}
-                    {view === "tutor" && <TutorMode onBack={()=>setView("home")} apiKey={apiKey} />}
+                    {view === "learn" && <LearnMode level={level} onBack={()=>setView("level-menu")} apiKey={apiKey} voice={voice} useSystemCn={useSystemCn} />}
+                    {view === "quiz" && <QuizMode level={level} onBack={()=>setView("level-menu")} apiKey={apiKey} voice={voice} useSystemCn={useSystemCn} />}
+                    {view === "tutor" && <TutorMode onBack={()=>setView("home")} apiKey={apiKey} voice={voice} useSystemCn={useSystemCn} />}
                 </div>
             );
         }
